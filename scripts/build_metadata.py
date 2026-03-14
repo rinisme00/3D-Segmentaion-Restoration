@@ -1,3 +1,15 @@
+"""
+Purpose:
+This script scans a raw dataset directory (following the 'Fantastic Breaks' structure),
+identifies relevant 3D object files (.npz, _b_.ply, _c.ply, _r_.ply), and builds a
+metadata CSV file summarizing the available files for each object and their dataset split.
+
+Usage:
+    python scripts/build_metadata.py \\
+        --raw-root /path/to/dataset/root \\
+        --output-csv /path/to/output/metadata.csv
+"""
+
 from __future__ import annotations
 
 import argparse
