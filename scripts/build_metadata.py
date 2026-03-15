@@ -102,7 +102,8 @@ def collect_metadata(raw_root: Path) -> pd.DataFrame:
             continue
             
         # Use a composite key for fractures to avoid overwriting pieces of the same object
-        composite_id = f"{object_id}_{fracture_id}"
+        # The user requested no _0 suffix for the primary fracture.
+        composite_id = object_id if fracture_id == "0" else f"{object_id}_{fracture_id}"
         
         # Initialize the record for this object_id if it doesn't exist yet
         rec = records.setdefault(
