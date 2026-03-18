@@ -11,8 +11,12 @@ def input_transform_net(point_cloud, is_training, bn_decay=None, K=3):
     """ Input (XYZ) Transform Net, input is BxNx3 gray image
         Return:
             Transformation matrix of size 3xK """
-    batch_size = point_cloud.get_shape()[0].value
-    num_point = point_cloud.get_shape()[1].value
+    batch_size = point_cloud.get_shape()[0]
+    if hasattr(batch_size, 'value'):
+        batch_size = batch_size.value
+    num_point = point_cloud.get_shape()[1]
+    if hasattr(num_point, 'value'):
+        num_point = num_point.value
 
     input_image = tf.expand_dims(point_cloud, -1)
     net = tf_util.conv2d(input_image, 64, [1,3],
@@ -44,7 +48,7 @@ def input_transform_net(point_cloud, is_training, bn_decay=None, K=3):
         biases = tf.get_variable('biases', [3*K],
                                  initializer=tf.constant_initializer(0.0),
                                  dtype=tf.float32)
-        biases += tf.constant([1,0,0,0,1,0,0,0,1], dtype=tf.float32)
+        biases = biases + tf.constant([1,0,0,0,1,0,0,0,1], dtype=tf.float32)
         transform = tf.matmul(net, weights)
         transform = tf.nn.bias_add(transform, biases)
 
@@ -56,8 +60,12 @@ def feature_transform_net(inputs, is_training, bn_decay=None, K=64):
     """ Feature Transform Net, input is BxNx1xK
         Return:
             Transformation matrix of size KxK """
-    batch_size = inputs.get_shape()[0].value
-    num_point = inputs.get_shape()[1].value
+    batch_size = inputs.get_shape()[0]
+    if hasattr(batch_size, 'value'):
+        batch_size = batch_size.value
+    num_point = inputs.get_shape()[1]
+    if hasattr(num_point, 'value'):
+        num_point = num_point.value
 
     net = tf_util.conv2d(inputs, 64, [1,1],
                          padding='VALID', stride=[1,1],
@@ -87,7 +95,7 @@ def feature_transform_net(inputs, is_training, bn_decay=None, K=64):
         biases = tf.get_variable('biases', [K*K],
                                  initializer=tf.constant_initializer(0.0),
                                  dtype=tf.float32)
-        biases += tf.constant(np.eye(K).flatten(), dtype=tf.float32)
+        biases = biases + tf.constant(np.eye(K).flatten(), dtype=tf.float32)
         transform = tf.matmul(net, weights)
         transform = tf.nn.bias_add(transform, biases)
 
