@@ -5,3 +5,6 @@ __pycache__/
 part_segmentation_ShapeNet.ipynb
 semantic_segmentation_with_FantasticBreakv1_Datasets.ipynb
 processed/
+classification/
+*.ckpt.*
+checkpoint
