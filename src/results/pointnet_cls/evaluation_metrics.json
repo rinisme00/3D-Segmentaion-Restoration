@@ -1,0 +1,42 @@
+{
+  "accuracy": 0.85,
+  "checkpoint_path": "../../results/pointnet_cls/best_model.ckpt",
+  "confusion_matrix": [
+    [
+      29,
+      1
+    ],
+    [
+      8,
+      22
+    ]
+  ],
+  "loss": 0.46187396049499513,
+  "metrics": {
+    "accuracy": 0.85,
+    "broken_f1": 0.8301886792452831,
+    "broken_precision": 0.9565217391304348,
+    "broken_recall": 0.7333333333333333,
+    "complete_f1": 0.8656716417910447,
+    "complete_precision": 0.7837837837837838,
+    "complete_recall": 0.9666666666666667,
+    "confusion_matrix": [
+      [
+        29,
+        1
+      ],
+      [
+        8,
+        22
+      ]
+    ],
+    "macro_f1": 0.847930160518164
+  },
+  "plot_paths": {
+    "confusion_matrix": "/storage/student6/dev/3D-Segmentation-Restoration/src/results/pointnet_cls/confusion_matrix.png",
+    "precision_recall_curve_broken": "/storage/student6/dev/3D-Segmentation-Restoration/src/results/pointnet_cls/precision_recall_curve_broken.png",
+    "roc_curve": "/storage/student6/dev/3D-Segmentation-Restoration/src/results/pointnet_cls/roc_curve.png"
+  },
+  "report_path": "/storage/student6/dev/3D-Segmentation-Restoration/src/results/pointnet_cls/classification_report.txt",
+  "top_errors_path": "/storage/student6/dev/3D-Segmentation-Restoration/src/results/pointnet_cls/top_errors.csv"
+}
