@@ -9,4 +9,4 @@ classification/
 *.ckpt.*
 checkpoint
 BreakingBad/
-breaking-bad-dataset/
+breakingbad_classification/
