@@ -1,12 +1,50 @@
-Fantastic_Breaks_v1/
-metadata_dict/
-.vscode/
+# ── Python ────────────────────────────────────────────────────────────
 __pycache__/
-part_segmentation_ShapeNet.ipynb
-semantic_segmentation_with_FantasticBreakv1_Datasets.ipynb
-processed/
-classification/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+.eggs/
+dist/
+build/
+
+# ── Editor / IDE ───────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── Datasets — raw ──────────────────────────────────────────────────────
+# Fantastic Breaks
+data/Fantastic_Breaks_v1/
+# Breaking Bad
+data/BreakingBad/
+breaking-bad-dataset/example_data/
+
+# ── Datasets — processed / generated ──────────────────────────────────
+data/processed/
+data/classification/
+data/fantastic-breaks-classification/
+data/breakingbad_classification/
+data/breakingbad_classification_full/
+
+# ── Results / experiment outputs ──────────────────────────────────────
+results/
+# But keep the directory itself tracked via .gitkeep
+
+# ── Checkpoints ────────────────────────────────────────────────────────
+*.ckpt
 *.ckpt.*
 checkpoint
-BreakingBad/
-breakingbad_classification/
+*.pt
+*.pth
+
+# ── Logs ──────────────────────────────────────────────────────────────
+*.log
+wandb/
+
+# ── Misc ──────────────────────────────────────────────────────────────
+*.DS_Store
+*.ipynb_checkpoints/
+.ipynb_checkpoints/
