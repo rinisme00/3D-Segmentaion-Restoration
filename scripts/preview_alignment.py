@@ -32,6 +32,8 @@ import numpy as np
 import open3d as o3d 
 import pandas as pd 
 
+from utils import find_transform, load_mesh
+
 # Matplotlib for headless environments
 import matplotlib
 matplotlib.use("Agg")
@@ -42,77 +44,6 @@ try:
     HAS_PV = True
 except Exception:
     HAS_PV = False 
-
-PREFERRED_TRANSFORM_KEYS = [
-    "transform",
-    "transforms",
-    "T",
-    "Rt",
-    "pose",
-    "matrix",
-    "alignment",
-]
-
-def to_4x4(arr: np.ndarray) -> np.ndarray:
-    """
-    Converts a given transformation matrix to a standard 4x4 homogenous matrix.
-    If the input is 3x4, it adds a [0, 0, 0, 1] bottom row.
-    """
-    arr = np.asarray(arr, dtype=np.float64)
-    if arr.shape == (4, 4):
-        return arr
-    if arr.shape == (3, 4):
-        out = np.eye(4, dtype=np.float64)
-        out[:3, :4] = arr
-        return out
-    raise ValueError(f"Unsupported transform shape: {arr.shape}")
-
-def find_transform(npz_path: Path, transform_key: Optional[str] = None) -> np.ndarray:
-    """
-    Loads and extracts a 4x4 transformation matrix from a given `.npz` file.
-    It can either look for a specific key or iterate through common keys 
-    (`PREFERRED_TRANSFORM_KEYS`) and shapes to deduce the correct matrix.
-    """
-    data = np.load(npz_path, allow_pickle=True)
-
-    if transform_key is not None:
-        if transform_key not in data.files:
-            raise KeyError(f"Key '{transform_key}' not found in {npz_path}")
-        arr = np.asarray(data[transform_key])
-        if arr.ndim == 3:
-            arr = arr[0]
-        return to_4x4(arr)
-
-    for key in PREFERRED_TRANSFORM_KEYS:
-        if key in data.files:
-            arr = np.asarray(data[key])
-            if arr.ndim == 3:
-                arr = arr[0]
-            try:
-                return to_4x4(arr)
-            except ValueError:
-                pass
-
-    for key in data.files:
-        arr = np.asarray(data[key])
-        if arr.ndim == 2 and arr.shape in {(4, 4), (3, 4)}:
-            return to_4x4(arr)
-        if arr.ndim == 3 and arr.shape[-2:] in {(4, 4), (3, 4)}:
-            return to_4x4(arr[0])
-
-    raise ValueError(f"No usable transform found in {npz_path}")
-
-
-def load_mesh(path: Path) -> o3d.geometry.TriangleMesh:
-    """
-    Reads a 3D triangle mesh from a file using Open3D and computes its vertex normals
-    for proper shading and rendering.
-    """
-    mesh = o3d.io.read_triangle_mesh(str(path))
-    if mesh.is_empty():
-        raise ValueError(f"Failed to read mesh: {path}")
-    mesh.compute_vertex_normals()
-    return mesh
 
 
 def mesh_to_point_cloud(mesh: o3d.geometry.TriangleMesh, n_points: int) -> o3d.geometry.PointCloud:

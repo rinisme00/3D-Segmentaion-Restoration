@@ -2,8 +2,8 @@
 """
 compute_geometric_features.py
 =================================
-Tính 8 geometric features per-point từ raw meshes và tạo ra enriched HDF5 files
-với input shape [B, N, 11] cho PointNeXt.
+Compute 8 geometric features per-point from raw meshes and generate enriched HDF5 files
+with input shape [B, N, 11] for PointNeXt.
 
 Feature layout (11 dims total):
     cols 0-2 │ x, y, z          │ XYZ normalized to unit sphere (same as baseline)
@@ -25,24 +25,30 @@ Supported datasets:
     breaking_bad     — OBJ meshes in data/BreakingBad/
 
 Usage:
-    # Activate conda env with PyVista + trimesh
-    source ~/anaconda3/bin/activate pointnet
+    # Step 0: always build manifests first (object-disjoint splits)
+    python scripts/build_manifests.py
 
-    # Fantastic Breaks (with meta-based fracture_mask)
+    # Fantastic Breaks
     python scripts/compute_geometric_features.py \\
         --dataset fantastic_breaks \\
         --data_root data/Fantastic_Breaks_v1 \\
-        --output_dir data/fantastic-breaks-classification \\
+        --output_dir data/fb_classification \\
         --num_points 8192 --seed 42
 
-    # Breaking Bad (no meta → fracture_mask = 0)
+    # Breaking Bad
     python scripts/compute_geometric_features.py \\
         --dataset breaking_bad \\
         --data_root data/BreakingBad \\
-        --split_dir data/BreakingBad/data_split \\
-        --output_dir data/breakingbad_classification \\
-        --subsets artifact everyday/Vase everyday/Mug everyday/Cup everyday/Plate \\
+        --output_dir data/bb_classification \\
         --num_points 8192 --balance undersample --seed 42
+
+    # Override manifest path explicitly
+    python scripts/compute_geometric_features.py \\
+        --dataset fantastic_breaks \\
+        --data_root data/Fantastic_Breaks_v1 \\
+        --manifest data/manifests/fantastic_breaks_classification.csv \\
+        --output_dir data/fb_classification \\
+        --num_points 8192
 """
 
 from __future__ import annotations
@@ -52,6 +58,7 @@ import glob
 import json
 import logging
 import os
+import sys
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -59,6 +66,11 @@ from typing import Optional
 
 import h5py
 import numpy as np
+import pandas as pd
+
+# Make src/ importable so we can use the canonical manifest validator
+sys.path.append(str(Path(__file__).resolve().parents[1]))
+from src.data.manifests.builder import validate_manifest
 
 logging.basicConfig(
     level=logging.INFO,
@@ -67,102 +79,120 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ── Feature constants ─────────────────────────────────────────────────────────
+# ── Feature constants — 9D default (Config B per report §6.6) ────────────────
+#
+#   cols 0-2 │ x, y, z            │ XYZ normalized to unit sphere
+#   cols 3-5 │ nx, ny, nz         │ estimated surface normals (covariance eigenvector)
+#   col  6   │ local_density      │ mean distance to k-NN
+#   col  7   │ surface_variation  │ λ_min / (λ1+λ2+λ3+ε)  — smoothness measure
+#   col  8   │ eigenentropy       │ −Σ λ̄ᵢ ln(λ̄ᵢ)  — neighbourhood disorder
+#
 FEATURE_NAMES = [
-    "x", "y", "z",        # 0-2 : XYZ (unit sphere normalized)
-    "k1",                  # 3   : max principal curvature
-    "k2",                  # 4   : min principal curvature
-    "H",                   # 5   : mean curvature = (k1+k2)/2
-    "K",                   # 6   : Gaussian curvature = k1×k2
-    "sa_v_ratio",          # 7   : surface area / volume
-    "dist_centroid",       # 8   : L2 dist from centroid
-    "local_density",       # 9   : mean dist to 16-NN
-    "boundary_dist",       # 10  : min dist to nearest boundary edge
+    "x", "y", "z",          # 0-2
+    "nx", "ny", "nz",       # 3-5
+    "local_density",         # 6
+    "surface_variation",     # 7
+    "eigenentropy",          # 8
 ]
-N_TOTAL_DIMS   = len(FEATURE_NAMES)  # 11
-GEOM_SLICE     = slice(3, N_TOTAL_DIMS)  # features to z-score normalize (3..10)
-CURV_CLIP      = 50.0    # symmetric clip for curvatures on unit-sphere mesh
-SAV_MAX        = 500.0   # safety cap for SA/V before global normalization
-KNN_K          = 16      # number of neighbours for local density
-BOUNDARY_DEFAULT = 1.0   # default boundary_dist for watertight meshes (no boundary)
+N_TOTAL_DIMS = len(FEATURE_NAMES)   # 9
+KNN_K        = 16                   # neighbours for local geometry
 
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Core: single-mesh processing
 # ═════════════════════════════════════════════════════════════════════════════
 
-def _compute_boundary_distance(
-    tm,
-    pts_norm: np.ndarray,
-    norm_verts: np.ndarray,
-) -> np.ndarray:
+def _compute_local_geometry(
+    pts: np.ndarray,   # (N, 3) float64, already normalized
+    k: int = KNN_K,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Compute per-point minimum distance to the nearest boundary edge.
+    Single KNN pass + vectorized local covariance eigendecomposition.
+    Returns (normals, local_density, surface_variation, eigenentropy) all float32.
 
-    Boundary edges are edges shared by exactly 1 face (open mesh boundary).
-    For watertight meshes (e.g. complete objects), there are no boundary edges
-    and all points get BOUNDARY_DEFAULT (1.0).
-
-    Returns: float32 array of shape (N,).
+    normals          (N, 3)  — eigenvector of smallest eigenvalue (raw, pre-orientation)
+    local_density    (N,)    — mean distance to k-NN
+    surface_variation(N,)    — λ_min / (λ1+λ2+λ3+ε)
+    eigenentropy     (N,)    — −Σ λ̄ᵢ ln(λ̄ᵢ+ε)
     """
     from scipy.spatial import cKDTree
 
-    # Find boundary edges: edges appearing in exactly 1 face
-    edges = tm.edges_sorted  # (E, 2)
-    # Use a fast counting approach via numpy
-    # Convert edge pairs to a single uint64 for fast counting
-    max_idx = int(edges.max()) + 1
-    edge_keys = edges[:, 0].astype(np.int64) * max_idx + edges[:, 1].astype(np.int64)
-    unique_keys, counts = np.unique(edge_keys, return_counts=True)
-    boundary_keys = unique_keys[counts == 1]
+    N = len(pts)
+    k_actual = min(k, N - 1)
+    eps = 1e-8
 
-    if len(boundary_keys) == 0:
-        # Watertight mesh — no boundary edges → uniform default
-        return np.full(len(pts_norm), BOUNDARY_DEFAULT, dtype=np.float32)
+    tree = cKDTree(pts)
+    dists, idxs = tree.query(pts, k=k_actual + 1)  # (N, k+1); col 0 = self
+    dists = dists[:, 1:]   # (N, k)
+    idxs  = idxs[:, 1:]   # (N, k)
 
-    # Decode boundary edge keys back to vertex indices
-    bnd_v0 = (boundary_keys // max_idx).astype(np.int64)
-    bnd_v1 = (boundary_keys % max_idx).astype(np.int64)
+    # local_density
+    local_density = dists.mean(axis=1).astype(np.float32)  # (N,)
 
-    # Compute midpoints of boundary edges in normalized space (fast approximation)
-    bnd_midpoints = (norm_verts[bnd_v0] + norm_verts[bnd_v1]) / 2.0  # (B, 3)
+    # Gather neighbour coordinates: (N, k, 3)
+    neighbors = pts[idxs]                                   # (N, k, 3)
+    centroids = neighbors.mean(axis=1, keepdims=True)       # (N, 1, 3)
+    centered  = neighbors - centroids                       # (N, k, 3)
 
-    # Build KD-tree on boundary midpoints and query for each sampled point
-    bnd_tree = cKDTree(bnd_midpoints.astype(np.float64))
-    dists, _ = bnd_tree.query(pts_norm.astype(np.float64), k=1)
+    # Batch 3×3 covariance matrices: (N, 3, 3)
+    cov = np.einsum("nki,nkj->nij", centered, centered) / k_actual
 
-    return dists.astype(np.float32)
+    # Batch eigendecomposition — eigh guarantees ascending order, numerically stable
+    evals, evecs = np.linalg.eigh(cov)   # evals (N,3), evecs (N,3,3)
+    evals = np.clip(evals, 0.0, None)    # numerical safety
+
+    # Normals = column 0 of evecs (eigenvector of smallest eigenvalue)
+    normals = evecs[:, :, 0].astype(np.float32)  # (N, 3)
+
+    # Surface variation: λ_min / (λ1+λ2+λ3+ε)
+    lsum = evals.sum(axis=1) + eps          # (N,)
+    surface_variation = (evals[:, 0] / lsum).astype(np.float32)   # (N,)
+
+    # Eigenentropy: −Σ λ̄ᵢ ln(λ̄ᵢ+ε)
+    lbar = np.clip(evals / lsum[:, None], eps, None)               # (N, 3)
+    eigenentropy = (-np.sum(lbar * np.log(lbar), axis=1)).astype(np.float32)  # (N,)
+
+    return normals, local_density, surface_variation, eigenentropy
+
+
+def _orient_normals(
+    normals: np.ndarray,   # (N, 3) float32 — raw covariance normals
+    tm,                    # trimesh mesh
+    face_ids: np.ndarray,  # (N,) face indices from surface sampling
+) -> np.ndarray:
+    """
+    Flip each normal so it agrees with the sampled face normal.
+    Uses face normals as reference (robust, always available from trimesh).
+    """
+    ref = tm.face_normals[face_ids].astype(np.float32)  # (N, 3)
+    dot = (normals * ref).sum(axis=1)                    # (N,)
+    signs = np.where(dot < 0, -1.0, 1.0).astype(np.float32)
+    return normals * signs[:, None]
 
 
 def process_mesh(
     mesh_path: str,
     num_points: int,
     seed: int,
-) -> Optional[np.ndarray]:
+) -> "np.ndarray | None":
     """
-    Load one mesh and return a [num_points, 11] float32 feature array.
+    Load one mesh and return a [num_points, 9] float32 feature array.
 
     Pipeline:
       1. Load mesh with trimesh.
-      2. Sample N points + get face indices (for barycentric interp).
-      3. Normalize XYZ to unit sphere (center + scale).
-      4. Apply same transform to mesh vertices → build PyVista PolyData.
-      5. Compute per-vertex curvatures (k1, k2, H, K) via PyVista.
-      6. Compute SA/V ratio from the normalized mesh.
-      7. Barycentric-interpolate vertex curvatures to sampled points.
-      8. Compute dist_centroid and local_density on the normalized point cloud.
-      9. Compute boundary_distance (topology-based, no meta needed).
-     10. Stack into [N, 11] and return.
+      2. Sample N surface points (uniform).
+      3. Normalize XYZ to unit sphere (center + max-radius scale).
+      4. Run _compute_local_geometry() — single KNN + batch eigendecomp:
+           → normals, local_density, surface_variation, eigenentropy
+      5. Orient normals using face normals as reference.
+      6. Stack into [N, 9] and return.
 
-    Returns None on any failure (degenerate mesh, loading error, etc.).
+    Returns None on any failure (degenerate mesh, load error, etc.).
     """
-    # Lazy import to keep module-level startup fast
     import trimesh
-    import pyvista as pv
-    from scipy.spatial import cKDTree
 
     try:
-        # ── 1. Load with trimesh ──────────────────────────────────────────────
+        # ── 1. Load ───────────────────────────────────────────────────────────
         tm = trimesh.load(mesh_path, force="mesh", process=False)
         if tm.vertices.shape[0] < 4 or len(tm.faces) < 4:
             raise ValueError(
@@ -170,103 +200,41 @@ def process_mesh(
             )
 
         # ── 2. Sample N surface points ────────────────────────────────────────
-        # trimesh.sample.sample_surface returns (pts, face_ids) where face_ids[i]
-        # is the triangle index that point i was sampled from.
         raw_pts, face_ids = trimesh.sample.sample_surface(
             tm, num_points, seed=seed
         )
         raw_pts = raw_pts.astype(np.float64)
 
         # ── 3. Per-sample XYZ normalization (center + unit sphere) ────────────
-        centroid = raw_pts.mean(axis=0)            # (3,)
-        shifted  = raw_pts - centroid              # (N, 3)
+        centroid = raw_pts.mean(axis=0)          # (3,)
+        shifted  = raw_pts - centroid             # (N, 3)
         scale    = np.max(np.linalg.norm(shifted, axis=1))
         if scale < 1e-8:
             raise ValueError(f"Near-zero bounding radius: {scale:.2e}")
-        pts_norm = (shifted / scale).astype(np.float32)   # (N, 3), unit sphere
+        pts_norm = (shifted / scale)              # (N, 3) float64
 
-        # ── 4. Normalize mesh vertices with the same transform ────────────────
-        norm_verts = ((tm.vertices - centroid) / scale).astype(np.float32)
+        # ── 4. Local geometry ─────────────────────────────────────────────────
+        normals, local_density, surface_variation, eigenentropy = \
+            _compute_local_geometry(pts_norm, k=KNN_K)
 
-        # Build PyVista PolyData from normalized vertices
-        faces_pv = np.hstack([
-            np.full((len(tm.faces), 1), 3, dtype=np.int32),
-            tm.faces.astype(np.int32),
-        ]).ravel()
-        pv_mesh = pv.PolyData(norm_verts, faces_pv)
+        # ── 5. Orient normals ─────────────────────────────────────────────────
+        normals = _orient_normals(normals, tm, face_ids)
 
-        # ── 5. Per-vertex curvatures via PyVista ──────────────────────────────
-        def _safe_curv(curv_type: str) -> np.ndarray:
-            """Compute curvature; clip and zero-fill NaN/Inf on failure."""
-            try:
-                vals = np.asarray(pv_mesh.curvature(curv_type), dtype=np.float32)
-                vals = np.nan_to_num(vals, nan=0.0,
-                                     posinf=CURV_CLIP, neginf=-CURV_CLIP)
-                return np.clip(vals, -CURV_CLIP, CURV_CLIP)
-            except Exception:
-                return np.zeros(pv_mesh.n_points, dtype=np.float32)
-
-        k1_vert = _safe_curv("maximum")   # (V,)
-        k2_vert = _safe_curv("minimum")   # (V,)
-        H_vert  = _safe_curv("mean")      # (V,)
-        K_vert  = _safe_curv("gaussian")  # (V,)
-
-        # ── 6. Global SA/V ratio (computed on normalized mesh) ────────────────
-        sa  = float(pv_mesh.area)
-        vol = abs(float(pv_mesh.volume))   # abs: open meshes can give signed vol
-        # For broken fragments (open meshes), vol ≈ 0 → high SA/V → discriminative!
-        sa_v = float(np.clip(sa / max(vol, 1e-4), 0.0, SAV_MAX))
-
-        # ── 7. Barycentric interpolation: vertex curvatures → sampled points ──
-        # face_verts_pos[i] = 3D positions of the 3 vertices of face face_ids[i]
-        face_verts_pos = norm_verts[tm.faces[face_ids]]          # (N, 3, 3)
-        bary = trimesh.triangles.points_to_barycentric(
-            triangles=face_verts_pos, points=pts_norm
-        ).astype(np.float64)                                      # (N, 3)
-        # Numerical safety: bary coords should sum to 1 per row
-        bary = np.clip(bary, 0.0, 1.0)
-        bary /= bary.sum(axis=1, keepdims=True).clip(1e-8, None)
-
-        def _bary_interp(attr_vert: np.ndarray) -> np.ndarray:
-            """Weighted sum of vertex attribute using barycentric coords."""
-            face_vals = attr_vert[tm.faces[face_ids]]    # (N, 3)
-            return (bary * face_vals).sum(axis=1).astype(np.float32)
-
-        k1_pts = _bary_interp(k1_vert)
-        k2_pts = _bary_interp(k2_vert)
-        H_pts  = _bary_interp(H_vert)
-        K_pts  = _bary_interp(K_vert)
-
-        # ── 8. Post-sampling point-cloud features ─────────────────────────────
-        # dist_centroid: L2 distance from origin (= centroid, since pts_norm is centered)
-        dist_centroid = np.linalg.norm(pts_norm, axis=1).astype(np.float32)  # (N,)
-
-        # local_density: mean distance to 16 nearest neighbours
-        tree = cKDTree(pts_norm.astype(np.float64))
-        nn_dists, _ = tree.query(pts_norm, k=KNN_K + 1)   # +1: first is self (dist=0)
-        local_density = nn_dists[:, 1:].mean(axis=1).astype(np.float32)      # (N,)
-
-        # ── 9. Boundary distance (topology-based) ─────────────────────────────
-        boundary_dist = _compute_boundary_distance(tm, pts_norm, norm_verts)  # (N,)
-
-        # ── 10. Assemble [N, 11] feature matrix ──────────────────────────────
-        sa_v_col = np.full(num_points, sa_v, dtype=np.float32)
-
+        # ── 6. Assemble [N, 9] ────────────────────────────────────────────────
+        pts_f32 = pts_norm.astype(np.float32)
         features = np.stack([
-            pts_norm[:, 0],   # x
-            pts_norm[:, 1],   # y
-            pts_norm[:, 2],   # z
-            k1_pts,           # k1
-            k2_pts,           # k2
-            H_pts,            # H
-            K_pts,            # K
-            sa_v_col,         # sa_v_ratio (broadcast)
-            dist_centroid,    # dist_centroid
-            local_density,    # local_density
-            boundary_dist,    # boundary_dist
-        ], axis=1)            # (N, 11)
+            pts_f32[:, 0],     # x
+            pts_f32[:, 1],     # y
+            pts_f32[:, 2],     # z
+            normals[:, 0],     # nx
+            normals[:, 1],     # ny
+            normals[:, 2],     # nz
+            local_density,     # local_density
+            surface_variation, # surface_variation
+            eigenentropy,      # eigenentropy
+        ], axis=1)             # (N, 9)
 
-        return features
+        return features.astype(np.float32)
 
     except Exception as exc:
         log.warning(f"  ✗  Failed [{Path(mesh_path).name}]: {exc}")
@@ -276,6 +244,7 @@ def process_mesh(
 # ═════════════════════════════════════════════════════════════════════════════
 # Normalization
 # ═════════════════════════════════════════════════════════════════════════════
+
 
 def compute_train_stats(
     data: np.ndarray,
@@ -324,91 +293,61 @@ def apply_normalization(
 # Dataset-specific sample discovery
 # ═════════════════════════════════════════════════════════════════════════════
 
-# ── Fantastic Breaks ──────────────────────────────────────────────────────────
+# ── Manifest-driven split loading (canonical path) ───────────────────────────
 
-def _discover_fb_samples_all(data_root: str) -> list[dict]:
-    """Walk Fantastic_Breaks_v1 and return list of {path, label, id}."""
-    samples = []
-    for cat_dir in sorted(glob.glob(os.path.join(data_root, "*"))):
-        if not os.path.isdir(cat_dir):
-            continue
-        for obj_dir in sorted(glob.glob(os.path.join(cat_dir, "*"))):
-            if not os.path.isdir(obj_dir):
-                continue
-            obj_id = os.path.basename(obj_dir)
-            c = os.path.join(obj_dir, "model_c.ply")
-            b = os.path.join(obj_dir, "model_b_0.ply")
-            if os.path.exists(c):
-                samples.append({"path": c, "label": 0, "id": f"{obj_id}_c"})
-            if os.path.exists(b):
-                samples.append({"path": b, "label": 1, "id": f"{obj_id}_b"})
-    return samples
-
-
-def discover_fb_splits(
-    data_root: str, seed: int = 42, test_ratio: float = 0.2
+def _manifest_to_samples(
+    manifest_path: str,
+    dataset_name: str,
+    balance: str = "none",
+    seed: int = 42,
 ) -> dict[str, list[dict]]:
     """
-    Reproduce the exact same stratified train/test split used by
-    prepare_classification_data.py (seed=42, test_ratio=0.2).
+    Load a manifest CSV and return a dict of {split_name: [sample_dict]}.
+
+    This is the canonical source of truth for split assignment.
+    Running validate_manifest() ensures object-disjoint integrity before
+    any feature extraction begins.
+
+    Each sample dict has:
+        path  : absolute path to the mesh file
+        label : 0 = complete, 1 = broken
+        id    : traceability string (base_object_id/variant_id)
     """
-    samples = _discover_fb_samples_all(data_root)
-    labels  = np.array([s["label"] for s in samples])
-    rng     = np.random.default_rng(seed)
+    df = pd.read_csv(manifest_path)
+    log.info(f"  Loaded manifest: {manifest_path} ({len(df)} rows)")
 
-    c_idx = np.where(labels == 0)[0]
-    b_idx = np.where(labels == 1)[0]
-    rng.shuffle(c_idx)
-    rng.shuffle(b_idx)
+    # Validate object-disjoint integrity — abort on leakage
+    try:
+        validate_manifest(df)
+        log.info("  Manifest validation: ✅ object-disjoint splits confirmed")
+    except (ValueError, FileNotFoundError) as exc:
+        log.error(f"  Manifest validation FAILED: {exc}")
+        raise
 
-    nc_test = int(len(c_idx) * test_ratio)
-    nb_test = int(len(b_idx) * test_ratio)
+    result: dict[str, list[dict]] = {}
+    for split_name, grp in df.groupby("split"):
+        if split_name in ("unknown", "None", None):
+            continue
+        samples = [
+            {
+                "path":  row["file_path_mesh"],
+                "label": int(row["label"]),
+                "id":    f"{row['base_object_id']}/{row['variant_id']}",
+            }
+            for _, row in grp.iterrows()
+            if row["file_path_mesh"] and isinstance(row["file_path_mesh"], str)
+        ]
+        if balance != "none" and dataset_name == "breaking_bad":
+            samples = _balance_bb(samples, balance, seed)
+        nc = sum(1 for s in samples if s["label"] == 0)
+        nb = sum(1 for s in samples if s["label"] == 1)
+        log.info(f"  {split_name:8s}: {len(samples):5d} samples  (complete={nc}, broken={nb})")
+        result[str(split_name)] = samples
 
-    test_idx  = np.concatenate([c_idx[:nc_test],  b_idx[:nb_test]])
-    train_idx = np.concatenate([c_idx[nc_test:],  b_idx[nb_test:]])
-    rng.shuffle(train_idx)
-    rng.shuffle(test_idx)
-
-    return {
-        "train": [samples[i] for i in train_idx],
-        "test":  [samples[i] for i in test_idx],
-    }
-
-
-# ── Breaking Bad ──────────────────────────────────────────────────────────────
-
-def _load_split_entries(split_dir: str, subset: str, split: str) -> list[str]:
-    """Load object paths from official Breaking Bad split .txt files."""
-    prefix   = subset.split("/")[0]
-    filepath = os.path.join(split_dir, f"{prefix}.{split}.txt")
-    if not os.path.exists(filepath):
-        log.warning(f"Split file not found: {filepath}")
-        return []
-    with open(filepath) as f:
-        entries = [l.strip() for l in f if l.strip()]
-    if "/" in subset:
-        entries = [e for e in entries if e.startswith(subset + "/")]
-    return entries
+    return result
 
 
-def _discover_bb_for_entry(data_root: str, obj_entry: str) -> dict:
-    """Return complete_path and broken_paths for one Breaking Bad object entry."""
-    obj_dir     = os.path.join(data_root, obj_entry)
-    complete    = os.path.join(obj_dir, "mode_0", "piece_0.obj")
-    frac_dir    = os.path.join(obj_dir, "fractured_0")
-    broken_list = []
-    if os.path.isdir(frac_dir):
-        broken_list = sorted(
-            os.path.join(frac_dir, f)
-            for f in os.listdir(frac_dir)
-            if f.endswith(".obj")
-        )
-    return {
-        "object_id":     obj_entry,
-        "complete_path": complete if os.path.exists(complete) else None,
-        "broken_paths":  broken_list,
-    }
-
+# ── Breaking Bad: balance helper (still used by manifest path) ────────────────
 
 def _balance_bb(
     samples: list[dict], strategy: str, seed: int
@@ -448,50 +387,6 @@ def _balance_bb(
 
     rng.shuffle(balanced)
     return balanced
-
-
-def discover_bb_splits(
-    data_root: str,
-    split_dir: str,
-    subsets: list[str],
-    seed: int = 42,
-    balance: str = "undersample",
-) -> dict[str, list[dict]]:
-    """
-    Build per-split sample lists for Breaking Bad, reproducing the same
-    logic as prepare_breakingbad_cls.py so that object coverage is consistent.
-    Split names in split files: 'train' and 'val'  →  mapped to 'train'/'test'.
-    """
-    result: dict[str, list[dict]] = {}
-
-    for file_split, out_split in [("train", "train"), ("val", "test")]:
-        raw: list[dict] = []
-        for subset in subsets:
-            for entry in _load_split_entries(split_dir, subset, file_split):
-                info = _discover_bb_for_entry(data_root, entry)
-                if info["complete_path"]:
-                    raw.append({
-                        "path": info["complete_path"],
-                        "label": 0,
-                        "id": f"{entry}/mode_0",
-                    })
-                for bp in info["broken_paths"]:
-                    raw.append({
-                        "path": bp,
-                        "label": 1,
-                        "id": f"{entry}/fractured_0/{os.path.basename(bp)}",
-                    })
-
-        result[out_split] = _balance_bb(raw, balance, seed)
-        nc = sum(1 for s in result[out_split] if s["label"] == 0)
-        nb = sum(1 for s in result[out_split] if s["label"] == 1)
-        log.info(
-            f"  {file_split!r} → {out_split!r}: "
-            f"{len(result[out_split])} samples "
-            f"(complete={nc}, broken={nb})"
-        )
-
-    return result
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -553,6 +448,15 @@ def save_enriched_h5(
 # Entry point
 # ═════════════════════════════════════════════════════════════════════════════
 
+def _default_manifest_path(dataset: str, project_root: str) -> str:
+    """Return the canonical manifest path for the given dataset."""
+    name_map = {
+        "fantastic_breaks": "fantastic_breaks_classification.csv",
+        "breaking_bad":     "breaking_bad_classification.csv",
+    }
+    return os.path.join(project_root, "data", "manifests", name_map[dataset])
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Compute geometric features for Breaking Bad / Fantastic Breaks.",
@@ -570,17 +474,17 @@ def parse_args() -> argparse.Namespace:
                    help="Points sampled per mesh. Default: 8192.")
     p.add_argument("--seed", type=int, default=42,
                    help="Random seed for sampling + splitting. Default: 42.")
+    p.add_argument(
+        "--manifest", default=None,
+        help="Path to manifest CSV (single source of truth for splits). "
+             "If not provided, auto-detected from data/manifests/{dataset}_classification.csv. "
+             "Run scripts/build_manifests.py first to generate the manifest.",
+    )
 
     # Breaking Bad specific
-    p.add_argument("--split_dir", default=None,
-                   help="[breaking_bad] Directory with *.train.txt / *.val.txt files.")
-    p.add_argument("--subsets", nargs="+",
-                   default=["artifact", "everyday/Vase",
-                            "everyday/Mug", "everyday/Cup", "everyday/Plate"],
-                   help="[breaking_bad] Subsets to include.")
     p.add_argument("--balance", default="undersample",
                    choices=["none", "undersample", "one_per_obj"],
-                   help="[breaking_bad] Class balance strategy. Default: undersample.")
+                   help="Class balance strategy for Breaking Bad. Default: undersample.")
 
     return p.parse_args()
 
@@ -589,35 +493,42 @@ def main() -> None:
     args = parse_args()
 
     # Resolve paths
+    project_root    = str(Path(__file__).resolve().parents[1])
     args.data_root  = os.path.abspath(args.data_root)
     args.output_dir = os.path.abspath(args.output_dir)
     os.makedirs(args.output_dir, exist_ok=True)
 
+    # Resolve manifest path
+    if args.manifest is None:
+        args.manifest = _default_manifest_path(args.dataset, project_root)
+    args.manifest = os.path.abspath(args.manifest)
+
     log.info("=" * 70)
     log.info(f"  Dataset     : {args.dataset}")
     log.info(f"  Data root   : {args.data_root}")
+    log.info(f"  Manifest    : {args.manifest}")
     log.info(f"  Output dir  : {args.output_dir}")
     log.info(f"  Num points  : {args.num_points}")
     log.info(f"  Seed        : {args.seed}")
     log.info("=" * 70)
 
-    # ── 1. Discover splits ────────────────────────────────────────────────────
-    log.info("Discovering splits...")
-    if args.dataset == "fantastic_breaks":
-        splits = discover_fb_splits(args.data_root, seed=args.seed)
-    else:
-        if args.split_dir is None:
-            raise ValueError("--split_dir is required for dataset=breaking_bad")
-        args.split_dir = os.path.abspath(args.split_dir)
-        splits = discover_bb_splits(
-            args.data_root, args.split_dir, args.subsets,
-            seed=args.seed, balance=args.balance,
+    # ── 1. Load splits from canonical manifest ────────────────────────────────
+    log.info("Loading splits from manifest...")
+    if not os.path.exists(args.manifest):
+        raise FileNotFoundError(
+            f"Manifest not found: {args.manifest}\n"
+            "Run 'python scripts/build_manifests.py' first to generate it."
         )
+    splits = _manifest_to_samples(
+        args.manifest, args.dataset, balance=args.balance, seed=args.seed
+    )
 
-    for sp, slist in splits.items():
-        nc = sum(1 for s in slist if s["label"] == 0)
-        nb = sum(1 for s in slist if s["label"] == 1)
-        log.info(f"  {sp:6s}: {len(slist):4d} samples  (complete={nc}, broken={nb})")
+    if not splits:
+        raise RuntimeError(
+            "No usable splits found in manifest. "
+            "Check that build_manifests.py was run and split column is not 'unknown'."
+        )
+    log.info(f"  Splits found: {sorted(splits.keys())}")
 
     # ── 2. Process TRAIN split (needed first for normalization stats) ──────────
     t0 = time.time()
@@ -690,24 +601,27 @@ def main() -> None:
     # ── 7. Save feature_metadata.json ────────────────────────────────────────
     import datetime
     metadata = {
-        "created":      datetime.datetime.now().isoformat(timespec="seconds"),
-        "dataset":      args.dataset,
-        "num_points":   args.num_points,
-        "seed":         args.seed,
-        "n_total_dims": N_TOTAL_DIMS,
+        "created":       datetime.datetime.now().isoformat(timespec="seconds"),
+        "dataset":       args.dataset,
+        "manifest":      args.manifest,
+        "num_points":    args.num_points,
+        "seed":          args.seed,
+        "feature_config": "default (9D: XYZ + normals + local_density + surface_variation + eigenentropy)",
+        "n_total_dims":  N_TOTAL_DIMS,
         "feature_names": FEATURE_NAMES,
         "normalization": {
-            "type":         "z-score (mean/std from train split)",
-            "clip_sigma":   5.0,
-            "xyz_note":     "XYZ (cols 0-2) normalized per-sample to unit sphere; NOT z-scored.",
-            "features":     train_stats,
+            "type":      "z-score (mean/std from train split)",
+            "clip_sigma": 5.0,
+            "xyz_note":  "XYZ (cols 0-2) normalized per-sample to unit sphere; NOT z-scored.",
+            "normals_note": "Normals (cols 3-5) z-scored; effectively a direction normalization.",
+            "features":  train_stats,
         },
         "splits": split_meta,
         "processing": {
-            "curvature_clip":   CURV_CLIP,
-            "sav_max":          SAV_MAX,
-            "knn_k":            KNN_K,
-            "interp_method":    "barycentric (trimesh.triangles.points_to_barycentric)",
+            "knn_k":        KNN_K,
+            "normal_method": "local covariance eigenvector (smallest eigenvalue), oriented by face normal",
+            "surface_variation": "lambda_min / (lambda_sum + 1e-8)",
+            "eigenentropy":      "-sum(lambda_bar * log(lambda_bar + 1e-8))",
         },
     }
 
@@ -723,9 +637,9 @@ def main() -> None:
     log.info("=" * 70)
 
     log.info("\nNext steps:")
-    log.info("  1. Update FantasticBreaksCls adapter to load *_data_enriched.h5")
-    log.info("  2. Set in_channels: 11 in the YAML config files")
-    log.info("  3. Retrain PointNeXt-B with enriched 11D features")
+    log.info("  1. Set in_channels: 9 in PointNeXt YAML configs")
+    log.info("  2. Re-run training with the new 9D enriched HDF5 files")
+    log.info("  3. Compare vs 3D baseline (--feature_preset xyz) in ablation")
 
 
 if __name__ == "__main__":

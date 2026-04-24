@@ -13,7 +13,6 @@ src/
   training/           Training pipelines
     pointnet_cls/     PointNet binary classifier (TensorFlow / Keras)
   pointnext/          PointNeXt framework (git submodule, forked openpoints)
-  ptv3/               Point Transformer V3 / Pointcept framework (cloned repo)
   ptv3_setup/         Pointcept dataset adapters and config files for this project
 ```
 

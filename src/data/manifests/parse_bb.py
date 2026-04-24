@@ -34,17 +34,27 @@ def load_split_entries(split_dir: Path, subset: str, split: str) -> list[str]:
     return entries
 
 def parse_breaking_bad(
-    data_root: str | Path, 
+    data_root: str | Path,
     split_dir: str | Path,
-    subsets: list[str] = ['artifact', 'everyday/Vase', 'everyday/Cup', 'everyday/Mug', 'everyday/Plate']
+    subsets: list[str] = ['artifact', 'everyday/Vase', 'everyday/Cup', 'everyday/Mug', 'everyday/Plate'],
 ) -> pd.DataFrame:
     """
     Scans Breaking Bad data based on official splits and existing files.
+
+    Design decisions (per fracture_classification_report.md §4.2):
+    - Complete mesh: ``mode_0/piece_0.obj`` only. Each BB object has ~20 mode_N
+      directories, but mode_0 contains the canonical unbroken mesh.
+    - Broken fragments: ``fractured_0/piece_*.obj`` only. Each BB object has
+      ~80 fractured_N directories, but we use only fractured_0 for simplicity.
+      Using all fracture cases would heavily skew the broken:complete ratio and
+      introduce highly similar samples from the same base object. The split is
+      still object-disjoint because the grouping key is ``base_object_id``, not
+      the fracture-case directory.
     """
     data_root = Path(data_root)
     split_dir = Path(split_dir)
     records = []
-    
+
     for subset in subsets:
         for split_name in ['train', 'val', 'test']:
             # official BB splits are often train/val. The main repo calls val 'test' in H5.

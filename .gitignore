@@ -23,11 +23,7 @@ data/BreakingBad/
 breaking-bad-dataset/example_data/
 
 # ── Datasets — processed / generated ──────────────────────────────────
-data/processed/
-data/classification/
-data/fantastic-breaks-classification/
-data/breakingbad_classification/
-data/breakingbad_classification_full/
+data/*
 
 # ── Results / experiment outputs ──────────────────────────────────────
 results/

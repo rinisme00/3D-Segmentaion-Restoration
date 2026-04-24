@@ -14,9 +14,7 @@ python scripts/<script_name>.py --help
 
 | Script | Purpose |
 |---|---|
-| `prepare_classification_data.py` | Fantastic Breaks → HDF5 point clouds for the PointNet pipeline. Samples N points per mesh, normalizes, and writes `train_data.h5` / `test_data.h5`. |
-| `prepare_breakingbad_cls.py` | Breaking Bad → HDF5 point clouds for the PointNeXt pipeline. Reads the official train/val split files, samples N points, optionally balances classes. |
-| `compute_geometric_features.py` | Computes the 11D geometric feature set (XYZ + k1/k2/H/K + SA/V ratio + dist_centroid + local_density + boundary_dist) and writes enriched HDF5 files for both datasets. **Note:** the k1/k2/H/K and global scalar features are deprecated per the project report — they are computed here but will be re-engineered in a later task. |
+| `compute_geometric_features.py` | Primary preprocessing script for both Fantastic Breaks and Breaking Bad. Samples N points per mesh, normalizes, and computes the 11D geometric feature set. Writes enriched HDF5 files compatible with PointNeXt. **Note:** the k1/k2/H/K and global scalar features are deprecated per the project report — they are currently computed but will be simplified in a later task. |
 
 ## Dataset Analysis
 
