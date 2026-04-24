@@ -16,15 +16,23 @@ def main():
     parser.add_argument("--gpu", type=str, default="0")
     parser.add_argument("--wandb", action="store_true", default=True, help="Enable WandB logging")
     parser.add_argument("--background", action="store_true", help="Run as background process")
+    parser.add_argument("--finetune", action="store_true", help="Enable transfer learning mode")
+    parser.add_argument("--checkpoint", type=str, help="Path to pretrained checkpoint for finetuning")
     
-    args = parser.parse_args()
+    args, extra_args = parser.parse_known_args()
 
     # Resolve paths
     project_root = Path(__file__).resolve().parents[1]
     pointnext_dir = project_root / "src" / "pointnext"
     
     dataset_name = "fantasticbreaks" if args.dataset == "fb" else "breakingbad"
-    cfg_path = f"cfgs/{dataset_name}/{args.model}.yaml"
+    
+    # Select config
+    if args.finetune:
+        cfg_name = f"{args.model}-finetune"
+    else:
+        cfg_name = args.model
+    cfg_path = f"cfgs/{dataset_name}/{cfg_name}.yaml"
     
     # Build command
     cmd = [
@@ -33,6 +41,18 @@ def main():
         "--cfg", cfg_path,
         f"wandb.use_wandb={str(args.wandb).lower()}"
     ]
+
+    if args.finetune:
+        if not args.checkpoint:
+            print("Error: --checkpoint is required when using --finetune")
+            sys.exit(1)
+        # Convert to absolute path to avoid issues with shifting CWD
+        ckpt_path = os.path.abspath(args.checkpoint)
+        cmd.append(f"pretrained_path={ckpt_path}")
+        cmd.append("mode=finetune")
+
+    # Add extra passthrough arguments
+    cmd.extend(extra_args)
     
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = args.gpu
@@ -57,6 +77,7 @@ def main():
     else:
         # Run in foreground
         subprocess.run(cmd, cwd=pointnext_dir, env=env)
+
 
 if __name__ == "__main__":
     main()
