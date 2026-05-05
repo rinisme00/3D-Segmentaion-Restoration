@@ -34,7 +34,7 @@ def iter_batches(data, labels, batch_size):
         yield data[start:end], labels[start:end]
 
 
-def run_train_epoch(sess, handles, cfg, train_data, train_label, epoch_seed):
+def run_train_epoch(sess, handles, cfg, train_data, train_label, epoch_seed, log_fn=print):
     """Run one training epoch with augmentation and return aggregate metrics."""
     rng = np.random.default_rng(epoch_seed)
     shuffled_data, shuffled_label = shuffle_data(train_data, train_label, rng=rng)
@@ -81,6 +81,9 @@ def run_train_epoch(sess, handles, cfg, train_data, train_label, epoch_seed):
         total_loss += float(loss_value)
         total_correct += int(np.sum(predictions == batch_label))
         total_seen += len(batch_label)
+
+        if (batch_idx + 1) % 50 == 0 or batch_idx == 0:
+             log_fn("  Batch {:03d}/{:03d} | loss={:.4f}".format(batch_idx + 1, num_batches, loss_value))
 
     return {
         "loss": total_loss / float(num_batches),
@@ -190,6 +193,9 @@ def train_model(cfg, dataset, handles, log_fn=print):
 
     with tf1.Session(graph=handles["graph"], config=create_session_config()) as sess:
         sess.run(tf1.global_variables_initializer())
+        if cfg.get("restore_path"):
+            log_fn("Restoring model from {}...".format(cfg["restore_path"]))
+            handles["saver"].restore(sess, cfg["restore_path"])
 
         for epoch in range(cfg["max_epoch"]):
             train_metrics = run_train_epoch(
@@ -199,6 +205,7 @@ def train_model(cfg, dataset, handles, log_fn=print):
                 train_data,
                 train_label,
                 epoch_seed=cfg["seed"] + epoch,
+                log_fn=log_fn,
             )
             val_metrics = run_eval_epoch(sess, handles, cfg, val_data, val_label)
             val_summary = val_metrics["metrics"]

@@ -70,17 +70,74 @@ def validate_reconstructed_split(dataset, train_idx, test_idx, labels):
 
 
 def resolve_mesh_path(object_id, data_root=None):
-    """Map an object id like `09006_c` to the corresponding mesh file path."""
-    data_root = Path(data_root or PROJECT_ROOT / "data" / "Fantastic_Breaks_v1")
-    if not data_root.exists():
-        raise FileNotFoundError("Could not locate mesh root at {}".format(data_root))
+    """Map an object id like `03008_c`, `1007/model_c`, or `everyday_Vase_.../piece_0` to a mesh path."""
+    fb_root = Path(data_root or PROJECT_ROOT / "data" / "Fantastic_Breaks_v1")
+    bb_root = PROJECT_ROOT / "data" / "BreakingBad"
 
-    base_id, suffix = object_id.rsplit("_", 1)
-    mesh_name = "model_c.ply" if suffix == "c" else "model_b_0.ply"
-    for category_dir in sorted(path for path in data_root.iterdir() if path.is_dir()):
-        candidate = category_dir / base_id / mesh_name
-        if candidate.exists():
-            return candidate
+    if "/" in object_id:
+        # New format: base_id/variant_id
+        parts = object_id.split("/")
+        variant_id = parts[-1]
+        raw_base   = parts[-2]
+        mesh_name  = variant_id + ".ply"
+    else:
+        # Legacy underscore format
+        raw_base, suffix = object_id.rsplit("_", 1)
+        mesh_name = "model_c.ply" if suffix == "c" else "model_b_0.ply"
+
+    # ── Fantastic Breaks search ──────────────────────────────────────────────
+    if fb_root.exists() and (raw_base.isdigit() or raw_base.startswith("0")):
+        padded = raw_base.zfill(5)
+        for name_variant in [padded, raw_base]:
+            matches = list(fb_root.glob("*/{}".format(name_variant)))
+            for match in matches:
+                candidate = match / mesh_name
+                if candidate.exists():
+                    return candidate
+
+    # ── Breaking Bad search ──────────────────────────────────────────────────
+    if bb_root.exists():
+        # BB IDs encode the category and directory name in the base_id:
+        #   artifact_81369_sf   -> artifact/81369_sf/
+        #   everyday_Vase_UUID  -> everyday/Vase/UUID/
+        # Strategy: the known top-level categories are 'artifact' and 'everyday'.
+        # We strip the category prefix to get the remaining path components.
+        dir_name = raw_base
+        search_prefix = None
+        for cat in ["artifact", "everyday"]:
+            prefix = cat + "_"
+            if raw_base.startswith(prefix):
+                remainder = raw_base[len(prefix):]  # e.g. "81369_sf" or "Vase_UUID"
+                # Check if remainder matches a subcategory in everyday/
+                cat_dir = bb_root / cat
+                if cat_dir.exists():
+                    # For 'everyday', there's an extra subcategory level (e.g. Vase)
+                    if cat == "everyday":
+                        # everyday_Vase_UUID -> everyday/Vase/UUID
+                        parts_rem = remainder.split("_", 1)
+                        if len(parts_rem) == 2:
+                            subcat, item_name = parts_rem
+                            search_prefix = cat_dir / subcat
+                            dir_name = item_name
+                    else:
+                        # artifact_81369_sf -> artifact/81369_sf
+                        search_prefix = cat_dir
+                        dir_name = remainder
+                break
+
+        # Build the list of directories to search within
+        search_roots = [search_prefix] if search_prefix and search_prefix.exists() else [bb_root]
+
+        for search_root in search_roots:
+            for candidate_dir in search_root.glob("{}".format(dir_name)):
+                if not candidate_dir.is_dir():
+                    continue
+                for ext in [".obj", ".ply"]:
+                    target_filename = mesh_name.replace(".ply", ext)
+                    # The piece file lives inside a fracture case subfolder
+                    for sub_candidate in candidate_dir.glob("**/{}".format(target_filename)):
+                        return sub_candidate
+
     raise FileNotFoundError("Could not find mesh for object_id={}".format(object_id))
 
 
@@ -179,7 +236,24 @@ def resolve_test_object_ids(dataset, cfg):
     if len(test_object_ids) == len(dataset["test_data"]):
         return test_object_ids
 
-    object_ids = load_object_ids(Path(cfg["data_dir"]) / "object_ids.txt")
+    data_dir = Path(cfg["data_dir"])
+    test_ids_path = data_dir / "test_object_ids_enriched.txt"
+    if test_ids_path.exists():
+        test_ids = np.asarray(load_object_ids(test_ids_path), dtype=object)
+        if len(test_ids) == dataset["test_total_count"]:
+            test_full_indices = np.asarray(
+                dataset.get("test_full_indices", np.arange(len(dataset["test_label"]))),
+                dtype=np.int32,
+            )
+            return test_ids[test_full_indices]
+
+    object_ids_path = data_dir / "object_ids.txt"
+    if not object_ids_path.exists():
+        raise FileNotFoundError(
+            "Could not find object_ids.txt or test_object_ids_enriched.txt in {}".format(data_dir)
+        )
+
+    object_ids = load_object_ids(object_ids_path)
     train_idx, test_idx, labels = reconstruct_classification_split(
         object_ids,
         test_ratio=cfg["classification_test_ratio"],

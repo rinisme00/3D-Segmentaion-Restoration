@@ -4,9 +4,11 @@ import h5py
 import numpy as np
 
 
-def load_h5(path):
+def load_h5(path, use_3d_only=False):
     with h5py.File(path, "r") as handle:
         data = handle["data"][:]
+        if use_3d_only:
+            data = data[:, :, :3]
         labels = handle["label"][:].reshape(-1).astype(np.int32)
     return data, labels
 
@@ -60,7 +62,27 @@ def reconstruct_classification_split(object_ids, test_ratio, seed):
 
 
 def attach_split_object_ids(cfg, dataset, train_full_label, test_full_label, log_fn=print):
-    object_ids_path = Path(cfg["data_dir"]) / "object_ids.txt"
+    data_dir = Path(cfg["data_dir"])
+    
+    # Try split-specific files first (most reliable)
+    train_ids_path = data_dir / "train_object_ids_enriched.txt"
+    test_ids_path = data_dir / "test_object_ids_enriched.txt"
+    
+    if train_ids_path.exists() and test_ids_path.exists():
+        train_ids = np.asarray(load_object_ids(train_ids_path), dtype=object)
+        test_ids = np.asarray(load_object_ids(test_ids_path), dtype=object)
+        
+        if len(train_ids) == len(train_full_label) and len(test_ids) == len(test_full_label):
+            train_full_indices = np.asarray(dataset["train_full_indices"], dtype=np.int32)
+            test_full_indices = np.asarray(dataset["test_full_indices"], dtype=np.int32)
+            
+            dataset = dict(dataset)
+            dataset["train_ids"] = train_ids[train_full_indices]
+            dataset["test_ids"] = test_ids[test_full_indices]
+            return dataset
+
+    # Fallback to global object_ids.txt reconstruction
+    object_ids_path = data_dir / "object_ids.txt"
     if not object_ids_path.exists():
         return dataset
 
@@ -123,8 +145,8 @@ def load_datasets(cfg, log_fn=print):
             "Missing classification H5 files in {}.".format(cfg["data_dir"])
         )
 
-    train_full_data, train_full_label = load_h5(train_path)
-    test_full_data, test_full_label = load_h5(test_path)
+    train_full_data, train_full_label = load_h5(train_path, use_3d_only=cfg.get("use_3d_only", False))
+    test_full_data, test_full_label = load_h5(test_path, use_3d_only=cfg.get("use_3d_only", False))
 
     cfg = dict(cfg)
     if cfg["num_point"] is None:

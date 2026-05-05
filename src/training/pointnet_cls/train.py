@@ -35,12 +35,14 @@ def parse_args():
     parser.add_argument("--train-limit", type=int, default=None)
     parser.add_argument("--test-limit", type=int, default=None)
     parser.add_argument("--checkpoint-metric", default=None)
+    parser.add_argument("--checkpoint", default=None, help="Path to checkpoint to restore for fine-tuning.")
     parser.add_argument("--disable-class-weights", action="store_true")
     parser.add_argument("--disable-rotate-augment", action="store_true")
     parser.add_argument("--disable-jitter-augment", action="store_true")
     parser.add_argument("--disable-scale-augment", action="store_true")
     parser.add_argument("--disable-shift-augment", action="store_true")
     parser.add_argument("--disable-dropout-augment", action="store_true")
+    parser.add_argument("--use-3d-only", action="store_true", help="Slice data to XYZ only (3D).")
     return parser.parse_args()
 
 
@@ -69,6 +71,7 @@ def main():
         scale_augment=False if args.disable_scale_augment else None,
         shift_augment=False if args.disable_shift_augment else None,
         dropout_augment=False if args.disable_dropout_augment else None,
+        use_3d_only=args.use_3d_only,
     )
 
     logger = make_logger(Path(cfg["log_dir"]) / "train.log")
@@ -78,6 +81,10 @@ def main():
     cfg, dataset = load_datasets(cfg, log_fn=logger)
     handles = build_graph(cfg)
     logger("Resolved training device: {}".format(handles["device_name"]))
+
+    if args.checkpoint:
+        logger("Fine-tuning mode: loading weights from {}".format(args.checkpoint))
+        cfg["restore_path"] = args.checkpoint
 
     # Save run metadata for reproducibility.
     config_path = Path(cfg["log_dir"]) / "config.json"

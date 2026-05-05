@@ -15,14 +15,10 @@ build/
 *.swp
 *.swo
 
-# ── Datasets — raw ──────────────────────────────────────────────────────
-# Fantastic Breaks
-data/Fantastic_Breaks_v1/
-# Breaking Bad
-data/BreakingBad/
-breaking-bad-dataset/example_data/
+thesis/
 
-# ── Datasets — processed / generated ──────────────────────────────────
+# ── Datasets
+
 data/*
 
 # ── Results / experiment outputs ──────────────────────────────────────

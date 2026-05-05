@@ -56,6 +56,7 @@ def parse_args():
     parser.add_argument("--top-k-errors", type=int, default=15)
     parser.add_argument("--test-sample-pos", type=int, default=None)
     parser.add_argument("--input-object-id", default=None)
+    parser.add_argument("--use-3d-only", action="store_true", help="Slice data to XYZ only (3D).")
     return parser.parse_args()
 
 
@@ -94,6 +95,7 @@ def main():
         eval_limit=args.eval_limit,
         seed=args.seed,
         num_inference_samples=args.num_inference_samples,
+        use_3d_only=args.use_3d_only,
     )
 
     logger = make_logger(Path(cfg["log_dir"]) / "evaluate.log")

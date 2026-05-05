@@ -7,10 +7,7 @@ def find_project_root(start_dir=None):
     start = Path(start_dir or Path.cwd()).resolve()
     candidates = (start, *start.parents) if start.is_dir() else tuple(start.parents)
     for candidate in candidates:
-        if (
-            (candidate / "src" / "pointnet-master").is_dir()
-            and (candidate / "data" / "classification").is_dir()
-        ):
+        if (candidate / "src" / "training" / "pointnet_cls").is_dir():
             return candidate
     raise FileNotFoundError("Could not locate project root from {}".format(start))
 
@@ -37,7 +34,13 @@ def load_tensorflow():
         tf.contrib = types.SimpleNamespace()
     if not hasattr(tf.contrib, "layers"):
         tf.contrib.layers = types.SimpleNamespace()
-    tf.contrib.layers.xavier_initializer = tf1.initializers.glorot_uniform
+    tf.contrib.layers.xavier_initializer = tf1.glorot_uniform_initializer
+    tf.contrib.layers.xavier_initializer_conv2d = tf1.glorot_uniform_initializer
+
+    tf.constant_initializer = tf1.constant_initializer
+    tf.truncated_normal_initializer = tf1.truncated_normal_initializer
+    tf.random_normal_initializer = tf1.random_normal_initializer
+    tf.glorot_uniform_initializer = tf1.glorot_uniform_initializer
 
     tf.get_variable = tf1.get_variable
     tf.variable_scope = tf1.variable_scope
@@ -58,16 +61,29 @@ def load_tensorflow():
 
 def list_available_gpus(tf):
     try:
-        return tf.config.list_physical_devices("GPU")
+        # Try TF2 way first
+        gpus = tf.config.list_physical_devices("GPU")
+        if gpus: return gpus
+    except Exception:
+        pass
+    
+    try:
+        # Try TF1 way
+        from tensorflow.python.client import device_lib
+        local_device_protos = device_lib.list_local_devices()
+        return [x for x in local_device_protos if x.device_type == 'GPU']
     except Exception:
         return []
 
 
 def resolve_device_name(tf, gpu_index):
     gpus = list_available_gpus(tf)
-    if gpu_index is None or gpu_index < 0 or gpu_index >= len(gpus):
+    if not gpus:
         return "/cpu:0"
-    return "/gpu:{}".format(gpu_index)
+    
+    # If index is invalid, default to the first available GPU
+    idx = gpu_index if (gpu_index is not None and 0 <= gpu_index < len(gpus)) else 0
+    return "/gpu:{}".format(idx)
 
 
 def create_session_config(tf1):

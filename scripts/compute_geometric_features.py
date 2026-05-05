@@ -174,6 +174,7 @@ def process_mesh(
     mesh_path: str,
     num_points: int,
     seed: int,
+    xyz_only: bool = False,
 ) -> "np.ndarray | None":
     """
     Load one mesh and return a [num_points, 9] float32 feature array.
@@ -212,6 +213,9 @@ def process_mesh(
         if scale < 1e-8:
             raise ValueError(f"Near-zero bounding radius: {scale:.2e}")
         pts_norm = (shifted / scale)              # (N, 3) float64
+
+        if xyz_only:
+            return pts_norm.astype(np.float32)
 
         # ── 4. Local geometry ─────────────────────────────────────────────────
         normals, local_density, surface_variation, eigenentropy = \
@@ -398,6 +402,7 @@ def process_split(
     num_points: int,
     seed: int,
     split_name: str,
+    xyz_only: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, list[str]]:
     """
     Process all meshes in a split.
@@ -416,7 +421,7 @@ def process_split(
                 f"{label_str:8s}  {Path(s['path']).name}"
             )
 
-        feat = process_mesh(s["path"], num_points, seed)
+        feat = process_mesh(s["path"], num_points, seed, xyz_only=xyz_only)
         if feat is None:
             failed += 1
             continue
@@ -428,7 +433,7 @@ def process_split(
     if failed:
         log.warning(f"  {failed} meshes failed to process in split={split_name!r}")
 
-    points = np.stack(all_feat,   axis=0).astype(np.float32)  # (B, N, 11)
+    points = np.stack(all_feat,   axis=0).astype(np.float32)  # (B, N, 3 or 11)
     labels = np.array(all_labels, dtype=np.int64).reshape(-1, 1)   # (B, 1)
     return points, labels, all_ids
 
@@ -485,6 +490,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--balance", default="undersample",
                    choices=["none", "undersample", "one_per_obj"],
                    help="Class balance strategy for Breaking Bad. Default: undersample.")
+    p.add_argument("--xyz_only", action="store_true",
+                   help="Only save XYZ coordinates (3D). Skip geometric features.")
 
     return p.parse_args()
 
@@ -534,21 +541,28 @@ def main() -> None:
     t0 = time.time()
     log.info("\nProcessing TRAIN split...")
     train_data, train_labels, train_ids = process_split(
-        splits["train"], args.num_points, args.seed, "train"
+        splits["train"], args.num_points, args.seed, "train", xyz_only=args.xyz_only
     )
     log.info(f"  Done in {time.time()-t0:.1f}s — shape {train_data.shape}")
 
     # ── 3. Compute global normalization stats from train features ─────────────
     log.info("\nComputing normalization statistics from TRAIN split...")
-    train_stats = compute_train_stats(train_data)
-    for name, st in train_stats.items():
-        log.info(
-            f"  {name:15s}  mean={st['mean']:8.4f}  std={st['std']:8.4f}"
-            f"  range=[{st['min']:.3f}, {st['max']:.3f}]"
-        )
+    if args.xyz_only:
+        log.info("  (Skipping normalization stats for xyz_only mode)")
+        train_stats = {}
+    else:
+        train_stats = compute_train_stats(train_data)
+        for name, st in train_stats.items():
+            log.info(
+                f"  {name:15s}  mean={st['mean']:8.4f}  std={st['std']:8.4f}"
+                f"  range=[{st['min']:.3f}, {st['max']:.3f}]"
+            )
 
     # ── 4. Normalize TRAIN features ───────────────────────────────────────────
-    train_data_norm = apply_normalization(train_data, train_stats)
+    if args.xyz_only:
+        train_data_norm = train_data
+    else:
+        train_data_norm = apply_normalization(train_data, train_stats)
 
     # ── 5. Process remaining splits ───────────────────────────────────────────
     other_splits: dict[str, tuple[np.ndarray, np.ndarray, list[str]]] = {
@@ -560,9 +574,12 @@ def main() -> None:
         log.info(f"\nProcessing {split_name.upper()} split...")
         t1 = time.time()
         data, labels, ids = process_split(
-            sample_list, args.num_points, args.seed, split_name
+            sample_list, args.num_points, args.seed, split_name, xyz_only=args.xyz_only
         )
-        data_norm = apply_normalization(data, train_stats)
+        if args.xyz_only:
+            data_norm = data
+        else:
+            data_norm = apply_normalization(data, train_stats)
         other_splits[split_name] = (data_norm, labels, ids)
         log.info(f"  Done in {time.time()-t1:.1f}s — shape {data.shape}")
 
@@ -572,7 +589,7 @@ def main() -> None:
     for split_name, (data_norm, labels, ids) in other_splits.items():
         # Use 'test' filename for non-train splits (FantasticBreaksCls expects
         # train_data.h5 / test_data.h5 naming)
-        h5_name   = f"{split_name}_data_enriched.h5"
+        h5_name   = f"{split_name}_data.h5" if args.xyz_only else f"{split_name}_data_enriched.h5"
         h5_path   = os.path.join(args.output_dir, h5_name)
         save_enriched_h5(h5_path, data_norm, labels)
 
