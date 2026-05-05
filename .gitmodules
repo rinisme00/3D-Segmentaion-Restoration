@@ -1,6 +1,6 @@
 [submodule "src/pointnext"]
 	path = src/pointnext
-	url = https://github.com/rinisme00/pointnext
+	url = git@github.com:rinisme00/pointnext.git
 	branch = main
 
 [submodule "breaking-bad-dataset"]
